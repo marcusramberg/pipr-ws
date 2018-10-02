@@ -1,139 +1,132 @@
 package Pipr::WS;
-use v5.10;
 
-use Dancer;
-use Dancer::Config;
-use Dancer::Plugin::Thumbnail;
+our $VERSION = '18.0.0';
 
-#use Dancer::Plugin::ConfigJFDI;
-use Data::Dumper;
+
+use Digest::MD5 'md5_hex';
 use Encode;
-use File::Slurp;
-use File::Share ':all';
-use File::Spec;
-use File::Type;
 use HTML::TreeBuilder;
 use Image::Size;
-use IO::Socket::SSL qw( SSL_VERIFY_NONE );
-use Pipr::LWPx::ParanoidAgent;
-use LWP::UserAgent::Cached;
-use List::Util;
-use Digest::MD5 qw(md5_hex);
-use File::Spec;
-use File::Path;
+use Mojo::DOM;
+use Mojo::Collection 'c';
+use Mojo::File 'path';
 use Mojo::URL;
-use Net::DNS::Resolver;
+use Mojo::UserAgent::Cached;
 use POSIX 'strftime';
-use Cwd;
-use URI;
-use URI::Escape;
 
-our $VERSION = '17.27.1';
-
-my $ua = Pipr::LWPx::ParanoidAgent->new(
-      agent => 'Reisegiganten PiPr',
-      ssl_opts => {
-         verify_hostname => 0,
-         SSL_verify_mode => SSL_VERIFY_NONE,
-      },
-);
+use Mojolicious::Lite -signatures;
 
 
-my $local_ua = LWP::UserAgent->new();
-$local_ua->protocols_allowed( ['file'] );
+my $config=plugin 'Config';
+plugin 'Thumbnail';
 
-set 'appdir' => eval { dist_dir('Pipr-WS') } || File::Spec->catdir(config->{appdir}, 'share');
 
-set 'confdir' => File::Spec->catdir(config->{appdir});
 
-set 'envdir'  => File::Spec->catdir(config->{appdir}, 'environments');
-set 'public'  => File::Spec->catdir(config->{appdir}, 'public');
-set 'views'   => File::Spec->catdir(config->{appdir}, 'views');
 
-Dancer::Config::load();
 
-$ua->whitelisted_hosts( @{ config->{whitelisted_hosts} } );
-$ua->timeout(config->{timeout});
+#set 'appdir' => eval { dist_dir('Pipr-WS') } || File::Spec->catdir(config->{appdir}, 'share');
+
+#set 'confdir' => File::Spec->catdir(config->{appdir});
+
+#set 'envdir'  => File::Spec->catdir(config->{appdir}, 'environments');
+#set 'public'  => File::Spec->catdir(config->{appdir}, 'public');
+#set 'views'   => File::Spec->catdir(config->{appdir}, 'views');
+#
+helper get_url => sub {
+    my ($c, $strip_prefix) = @_;
+
+    my $request_uri = $c->request->url;
+    $request_uri =~ s{ \A /? \Q$strip_prefix\E /? }{}gmx;
+
+    # if we get an URL like: http://pipr.opentheweb.org/overblikk/resized/300x200/http://g.api.no/obscura/external/9E591A/100x510r/http%3A%2F%2Fnifs-cache.api.no%2Fnifs-static%2Fgfx%2Fspillere%2F100%2Fp1172.jpg
+    # We want to re-escape the external URL in the URL (everything is unescaped on the way in)
+    # NOT needed?
+    #    $request_uri =~ s{ \A (.+) (http://.*) \z }{ $1 . URI::Escape::uri_escape($2)}ex;
+
+    return $request_uri;
+};
+
+helper cached_ua => sub {
+    state $ua=Mojo::UserAgent::Cached->new()->insecure(1)->timeout($config->{timeout});
+    return $ua;
+};
+
 
 get '/' => sub {
-    template 'index' => { sites => config->{sites} } if config->{environment} ne 'production';
+    my $c = shift;
+    $c->render('index' => { sites => $config->{sites} }) if $c->mode ne 'production';
 };
 
 # Proxy images
-get '/*/p/**' => sub {
-    my ( $site, $url ) = splat;
+get '/:site/p/*url' => sub {
+     my $c = shift;
+    my ( $site, $url ) = $c->stash->{qw/site url/};
 
-    $url = get_url("$site/p");
+    $url = $c->get_url("$site/p");
 
-    my $site_config = config->{sites}->{ $site };
+    my $site_config = $config->{sites}->{ $site };
     $site_config->{site} = $site;
-    if (config->{restrict_targets}) {
-        return do { error "illegal site: $site";   status 'not_found' } if ! $site_config;
+    if ($config->{restrict_targets}) {
+        $c->render(status=>401, text=>'Invalid site');
     }
-    var 'site_config' => $site_config;
+    $c->stash(site_config => $site_config);
 
-    my $file = get_image_from_url($url);
+    my $file = path($c->get_image_from_url($url));
 
     # try to get stat info
     my @stat = stat $file or do {
-        status 404;
-        return '404 Not Found';
+        return $c->render(status=>404, text=>'File not found')
     };
 
     # prepare Last-Modified header
     my $lmod = strftime '%a, %d %b %Y %H:%M:%S GMT', gmtime $stat[9];
 
     # processing conditional GET
-    if ( ( header('If-Modified-Since') || '' ) eq $lmod ) {
-        status 304;
-        return;
+    if ( ( $c->req->header->if_modified_since || '' ) eq $lmod ) {
+        return $c->render(status=>304, text=> 'Not modified');
     }
 
-    open my $fh, '<:raw', $file or do {
-        error "can't read cache file '$file'";
-        status 500;
-        return '500 Internal Server Error';
-    };
 
     my $ft = File::Type->new();
 
     # send useful headers & content
-    content_type $ft->mime_type($file);
-    header('Cache-Control' => 'public, max-age=86400');
-    header 'Last-Modified' => $lmod;
-    undef $/; # slurp
-    return scalar <$fh>;
+    $c->res->headers->cache_control('public, max-age=86400');
+    $c->res->headers->last_modified($lmod);
+    $c->res->headers->content_type($ft->mime_type($file));
+    $c->render(data => $file->slurp);
 
 };
 
-get '/*/dims/**' => sub {
-    my ( $site, $url ) = splat;
+get '/:site/dims/*url' => sub {
+    my $c= shift;
+    my ( $site, $url ) = $c->stash->{qw/site url/};
 
-    $url = get_url("$site/dims");
+    $url = $c->get_url("$site/dims");
 
-    my $local_image = get_image_from_url($url);
+    my $local_image = $c->get_image_from_url($url);
     my ( $width, $height, $type ) = Image::Size::imgsize($local_image);
 
-    content_type 'application/json';
-    return to_json {
+    return $c->render(json => {
         image => { type => lc $type, width => $width, height => $height }
-    };
+    });
 };
 
 # support uploadcare style
-get '/*/-/*/*/*/**' => sub {
-   my ($site, $cmd, $params, $param2, $url ) = splat;
+get '/:$site/-/:cmd/:params/:param2/*url' => sub {
+   my $c = shift;
+   my ($site, $cmd, $params, $param2, $url ) = $c->stash->{qw/site cmd params param2 url/};
 
-   $url = get_url("$site/-/$cmd/$params/$param2");
+   $url = $c->get_url("$site/-/$cmd/$params/$param2");
 
    if ($cmd eq 'scale_crop' && $param2 eq 'center') {
        return gen_image($site, 'scale_crop_centered', $params, $url);
    }
-   return do { error 'illegal command'; status '401'; };
+   return $c->render(text=>'illegal command', status => '401');
 };
 
-get '/*/*/*/**' => sub {
-    my ( $site, $cmd, $params, $url ) = splat;
+get '/:site/:cmd/:params/*url' => sub {
+   my $c=shift;
+   my ($site, $cmd, $params, $url ) = $c->stash->{qw/site cmd params url/};
 
     $url = get_url("$site/$cmd/$params");
 
@@ -141,42 +134,42 @@ get '/*/*/*/**' => sub {
 };
 
 sub gen_image {
-    my ($site, $cmd, $params, $url) = @_;
+    my ($c,$site, $cmd, $params, $url) = @_;
 
-    return do { error 'no site set';    status 'not_found' } if !$site;
-    return do { error 'no command set'; status 'not_found' } if !$cmd;
-    return do { error 'no params set';  status 'not_found' } if !$params;
-    return do { error 'no url set';     status 'not_found' } if !$url;
+    return $c->render(status=>401, text=>'no site set') if !$site;
+    return $c->render(status=>401, text=>'no command specified') if !$cmd;
+    return $c->render(status=>401, text=>'no params set') if !$params;
+    return $c->render(status=>401, text=>'no url set') if !$url;
 
-    my $site_config = config->{sites}->{ $site };
+    my $site_config = $config->{sites}->{ $site };
     $site_config->{site} = $site;
-    if (config->{restrict_targets}) {
-      return do { error "illegal site: $site";   status 'not_found' } if ! $site_config;
+    if ($config->{restrict_targets}) {
+      return $c->render(status=>401, text=>'invalid site') if !$site_config;
     }
-    var 'site_config' => $site_config;
+    $c->stash('site_config' => $site_config);
 
     my ( $format, $offset ) = split /,/, $params;
     my ( $x,      $y )      = split /x/, $offset || '0x0';
     my ( $width,  $height ) = split /x/, $format;
 
-    if ( config->{restrict_targets} ) {
+    if ( $config->{restrict_targets} ) {
         my $info = "'$url' with '$params'";
-        debug "checking $info";
-        return do { error "no matching targets: $info"; status 'forbidden' }
-          if !List::Util::first { $url =~ m{ $_ }gmx; }
-            @{ $site_config->{allowed_targets} }, keys %{ $site_config->{shortcuts} || {} };
-        return do { error "no matching sizes: $info"; status 'forbidden' }
-          if !List::Util::first { $format =~ m{\A \Q$_\E \z}gmx; }
-            @{ $site_config->{sizes} };
+        $c->app->log->debug("checking $info");
+        return $c->render(status=>401, text=>"no matching targets: $info")
+            unless c(@{ $site_config->{allowed_targets} }, keys %{ $site_config->{shortcuts} || {} })
+              ->first(sub { $url =~ m{ $_ }gmx; });
+        return $c->render(status=>401, text=>"no matching sizes: $info")
+            unless c( $site_config->{sizes} )
+              ->first(sub { $format =~ m{\A \Q$_\E \z}gmx; });
     }
 
-    my $local_image = get_image_from_url($url);
-    return do { error "unable to download picture: $url"; status 'not_found' }
+    my $local_image = $c->get_image_from_url($url);
+    return $c->render(status=>501, text=>"unable to download picture: $url")
       if !$local_image;
 
-    my $thumb_cache = File::Spec->catdir(config->{plugins}->{Thumbnail}->{cache}, $site);
+    my $thumb_cache = path($config->{plugins}->{Thumbnail}->{cache})->child($site)->list_tree;
 
-    header('Cache-Control' => 'public, max-age=86400');
+    $c->res->headers->cache_control('public, max-age=86400');
 
     my $switch = {
         'resized' => sub {
@@ -231,7 +224,7 @@ sub gen_image {
             };
         },
         'default' => sub {
-            return do { error 'illegal command'; status '401'; };
+            return $c->render(status=>401, text=>"unknown command: $cmd")
         }
   };
 
@@ -240,14 +233,12 @@ sub gen_image {
       die $body if $body =~ /Internal Server Error/;
       return $body;
   } or do {
-      error 'Unable to load image: ' . $@;
-      status '400';
-      return;
+      return $c->render(status=>400, text=>"Unable to load image: $@")
   };
 };
 
 sub get_image_from_url {
-    my ($url) = @_;
+    my ($c, $url) = @_;
 
     my $local_image = download_url($url);
     my $ft          = File::Type->new();
@@ -258,46 +249,43 @@ sub get_image_from_url {
     return $local_image
       if ( $ft->checktype_filename($local_image) =~ m{ \A image }gmx );
 
-    debug "fetching image from '$local_image'";
+    $c->app->log->debug("fetching image from '$local_image'");
 
-    my $res = $local_ua->get("file:$local_image");
+    my $res = $c->cached_ua->get("file://$local_image");
+    my $dom = Mojo::DOM->new( $res->decoded_content );
+    my $el  = $dom->at( 'meta[property="og:image"]' );
 
-    my $tree = HTML::TreeBuilder->new_from_content( $res->decoded_content );
-
-    my $ele = $tree->find_by_attribute( 'property', 'og:image' );
-    my $image_url = $ele && $ele->attr('content');
+    my $image_url = $el && $el->attr('content');
 
     if ( !$image_url ) {
-        $ele = $tree->look_down(
-            '_tag' => 'img',
-            sub {
-                debug "$url: " . $_[0]->as_HTML;
-                ( $url =~ m{ dn\.no | nettavisen.no }gmx
-                      && defined $_[0]->attr('title') )
-                  || ( $url =~ m{ nrk\.no }gmx && $_[0]->attr('longdesc') );
+        $el = $dom->find('img')->first(sub {
+            $c->app->log->debug("$url: " . $_[0]->as_HTML);
+            return ( $url =~ m{ dn\.no | nettavisen.no }gmx
+                && defined $_[0]->attr('title') )
+                || ( $url =~ m{ nrk\.no }gmx && $_[0]->attr('longdesc') );
             }
         );
-        $image_url = $ele && $ele->attr('src');
+        $image_url = $el && $el->attr('src');
     }
 
     if ($image_url) {
-        my $u = URI->new_abs( $image_url, $url );
+        my $u = Mojo::URL->new($image_url)->base($url)->to_abs;
         $image_url = $u->canonical;
-        debug "fetching: $image_url instead from web page";
-        $local_image = download_url( $image_url, $local_image, 1 );
+        $c->log->app->debug("fetching: $image_url instead from web page");
+        $local_image = $c->download_url( $image_url, $local_image, 1 );
     }
 
     return $local_image;
 }
 
 sub download_url {
-    my ( $url, $local_file, $ignore_cache ) = @_;
+    my ($c, $url, $local_file, $ignore_cache ) = @_;
 
     $url =~ s/\?$//;
 
-    my $site_config = var 'site_config';
+    my $site_config = $c->stash('site_config');
 
-    debug "downloading url: $url";
+    $c->app->log->debug("downloading url: $url");
 
     for my $path (keys %{$site_config->{shortcuts} || {}}) {
         if ($url =~ s{ \A /? $path }{}gmx) {
@@ -314,53 +302,39 @@ sub download_url {
     $url =~ s{^(https?):/(?:[^/])}{$1/}mx;
 
     if ($url !~ m{ \A (https?|ftp)}gmx) {
-        if ( config->{allow_local_access} ) {
-            my $local_file = File::Spec->catfile( config->{appdir}, $url );
-            debug "locally accessing $local_file";
+        if ( $config->{allow_local_access} ) {
+            my $local_file = path( $config->{appdir}, $url )->slurp;
+            $c->app->log->debug("locally accessing $local_file");
             return $local_file if $local_file;
         }
     }
 
     $local_file ||= File::Spec->catfile(
         (
-            File::Spec->file_name_is_absolute( config->{'cache_dir'} )
+            File::Spec->file_name_is_absolute( $config->{'cache_dir'} )
             ? ()
-            : config->{appdir}
+            : $config->{appdir}
         ),
-        config->{'cache_dir'},
+        $config->{'cache_dir'},
         $site_config->{site},
         _url2file($url)
     );
 
     File::Path::make_path( dirname($local_file) );
 
-    debug 'local_file: ' . $local_file;
+    $c->app->log->debug('local_file: ' . $local_file);
 
     return $local_file if !$ignore_cache && -e $local_file;
 
-    debug "fetching from the net... ($url)";
+    $c->app->log->debug("fetching from the net... ($url)");
 
-    my $res = eval { $ua->get($url, ':content_file' => $local_file); };
-    error "Error getting $url: (".(request->uri).")" . ($res ? $res->status_line : $@) . Dumper($site_config)
+    my $res = eval { $c->cached_ua->get($url, ':content_file' => $local_file); };
+    return $c->render(status=>400, text=>"Error getting $url: (".(request->uri).")" . ($res ? $res->status_line : $@) . $c->dumper($site_config))
       unless ($res && $res->is_success);
 
     # Try fetching image from HTML page
 
     return (($res && $res->is_success) ? $local_file : ($res && $res->is_success));
-}
-
-sub get_url {
-    my ($strip_prefix) = @_;
-
-    my $request_uri = request->request_uri();
-    $request_uri =~ s{ \A /? \Q$strip_prefix\E /? }{}gmx;
-
-    # if we get an URL like: http://pipr.opentheweb.org/overblikk/resized/300x200/http://g.api.no/obscura/external/9E591A/100x510r/http%3A%2F%2Fnifs-cache.api.no%2Fnifs-static%2Fgfx%2Fspillere%2F100%2Fp1172.jpg
-    # We want to re-escape the external URL in the URL (everything is unescaped on the way in)
-    # NOT needed?
-    #    $request_uri =~ s{ \A (.+) (http://.*) \z }{ $1 . URI::Escape::uri_escape($2)}ex;
-
-    return $request_uri;
 }
 
 sub _url2file {
@@ -396,16 +370,21 @@ sub expand_macros {
 }
 
 
-true;
+1;
 
 =pod
+
+=head NAME
+
+Pipr
+
+=head1 DESCRIPTION
+
+Picture Proxy/Provider/Presenter
 
 =head1 AUTHOR
 
    Nicolas Mendoza <mendoza@pvv.ntnu.no>
-
-=head1 ABSTRACT
-
-   Picture Proxy/Provider/Presenter
+   Marcus Ramberg <mramberg@cpan.org>
 
 =cut
